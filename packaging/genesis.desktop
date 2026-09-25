@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Genesis Council
+Comment=Multi-LLM coding assistant for the current project
+Exec=genesis
+Terminal=false
+Categories=Development;Utility;

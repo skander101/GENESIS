@@ -1,0 +1,11 @@
+Package: genesis-council
+Version: 0.1.0
+Section: devel
+Priority: optional
+Architecture: amd64
+Maintainer: GENESIS contributors
+Depends: python3 (>= 3.10), python3-tk
+Description: Multi-LLM coding assistant for a project directory
+ Genesis runs the Council orchestrator against the current project directory.
+ It checks the local opencode installation, starts the GUI when no request is
+ supplied, and passes explicit Council arguments through unchanged.

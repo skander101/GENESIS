@@ -20,6 +20,7 @@ import re
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from difflib import SequenceMatcher
@@ -81,6 +82,7 @@ _PURE_CALLS = os.environ.get("COUNCIL_NO_PURE", "").strip().lower() not in (
 # Reasoning effort for cheap utility phases (triage/agreement). Off by default:
 # some providers hang on `variant=minimal`. Set COUNCIL_UTILITY_VARIANT to opt in.
 _UTILITY_VARIANT = os.environ.get("COUNCIL_UTILITY_VARIANT", "").strip() or None
+OPENCODE_BIN = os.environ.get("GENESIS_OPENCODE", "").strip() or "opencode"
 
 # Requests this short, with no code keywords and no file, skip the council
 # pipeline entirely (triage -> proposals -> debate -> judge is pure overhead).
@@ -102,6 +104,17 @@ ANSWER_CALLBACK = None
 # ---------------------------------------------------------------------------
 
 _model_states: dict[str, str] = {}
+_SESSION_STATE = {"failed": False}
+
+
+def reset_session_state() -> None:
+    """Reset the process-level failure flag for a new run."""
+    _SESSION_STATE["failed"] = False
+
+
+def session_failed() -> bool:
+    """True when every model in a slot failed during this run."""
+    return bool(_SESSION_STATE["failed"])
 
 
 def set_model_state(model: str, state: str) -> None:
@@ -199,6 +212,7 @@ def _is_trivial_request(request: str, file_path: Optional[str]) -> bool:
 
 
 
+_ALL_MODELS_CACHE: dict = {"t": 0.0, "v": None}
 _FREE_MODELS_CACHE: dict = {"t": 0.0, "v": None}
 _JUDGE_CACHE: dict = {"t": 0.0, "v": None}
 _CACHE_TTL = 300.0  # seconds — re-detection happens occasionally on long runs
@@ -211,10 +225,10 @@ def first_working_model() -> str:
     Failed (rate-limited / connection-error) models are skipped so we only
     ever talk to models that are actually reachable.
     """
-    return next(
-        (m for m in get_free_models() if not is_model_failed(m)),
-        get_free_models()[0],
-    )
+    models = get_free_models()
+    if not models:
+        return DEFAULT_FREE_MODELS[0]
+    return next((m for m in models if not is_model_failed(m)), models[0])
 
 
 def is_model_failed(model: str) -> bool:
@@ -236,30 +250,47 @@ def get_fast_model() -> str:
     return first_working_model()
 
 
+def _query_all_opencode_models(force_refresh: bool = False) -> list[str]:
+    """Return the model identifiers reported by ``opencode models``."""
+    now = time.time()
+    if (
+        not force_refresh
+        and _ALL_MODELS_CACHE["v"] is not None
+        and now - _ALL_MODELS_CACHE["t"] < _CACHE_TTL
+    ):
+        return list(_ALL_MODELS_CACHE["v"])
+
+    try:
+        proc = subprocess.run(
+            [OPENCODE_BIN, "models"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(proc.stderr.strip() or f"exit {proc.returncode}")
+        models = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    except Exception as e:  # noqa: BLE001
+        log("MODELS", f"model discovery failed: {e}")
+        models = []
+
+    _ALL_MODELS_CACHE.update(t=now, v=models)
+    return list(models)
+
+
 def _query_opencode_models() -> list[str]:
     """
     Auto-detect the free models available right now.
 
     Free models are discovered by filtering ``opencode models`` for entries
-    whose name contains "free", then checked live for reachability. Falls
-    back to ``DEFAULT_FREE_MODELS`` if detection fails. Results are cached
-    for ``_CACHE_TTL`` seconds.
+    whose name contains "free". Falls back to ``DEFAULT_FREE_MODELS`` if
+    detection fails. Results are cached for ``_CACHE_TTL`` seconds.
     """
     now = time.time()
     if _FREE_MODELS_CACHE["v"] is not None and now - _FREE_MODELS_CACHE["t"] < _CACHE_TTL:
         return list(_FREE_MODELS_CACHE["v"])
 
-    try:
-        proc = __import__("subprocess").run(
-            ["opencode", "models"], capture_output=True, text=True, timeout=15,
-        )
-        if proc.returncode != 0:
-            raise RuntimeError(proc.stderr.strip() or f"exit {proc.returncode}")
-        all_models = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
-    except Exception as e:  # noqa: BLE001
-        log("MODELS", f"model discovery failed: {e}")
-        all_models = []
-
+    all_models = _query_all_opencode_models()
     detected = [m for m in all_models if "free" in m.lower()]
     if detected:
         _FREE_MODELS_CACHE.update(t=now, v=detected)
@@ -275,26 +306,36 @@ def _query_opencode_models() -> list[str]:
 # canonical implementation; other modules (interactive mode, GUI, phases)
 # still call ``get_free_models()`` and ``get_judge_models()``.
 get_free_models = _query_opencode_models
-get_judge_models = lambda: [get_judge_model()] if get_judge_model() else []
+
+
+def get_judge_models() -> list[str]:
+    """Return the resolved judge model as a one-item list."""
+    model = get_judge_model()
+    return [model] if model else []
 
 
 
 def get_judge_model() -> str:
     """
-    Resolve the judge model: the preferred Gemini if available,
-    otherwise the latest usable Gemini in the detected list.
+    Resolve the judge model from the models currently reported by OpenCode.
+
+    The preferred model is never returned unless OpenCode reports it, so a
+    stale cache or a free-only environment cannot select an unavailable model.
     """
     now = time.time()
-    if _JUDGE_CACHE["v"] is not None and now - _JUDGE_CACHE["t"] < _CACHE_TTL:
-        return _JUDGE_CACHE["v"]
+    all_models = _query_all_opencode_models(force_refresh=True)
+    cached = _JUDGE_CACHE["v"]
+    if (
+        cached is not None
+        and now - _JUDGE_CACHE["t"] < _CACHE_TTL
+        and (not all_models or cached in all_models)
+    ):
+        return cached
 
+    available = set(all_models)
     banned = ("image", "tts", "live", "embedding", "computer", "research")
-    try:
-        all_models = _query_opencode_models()
-    except Exception:  # noqa: BLE001
-        all_models = []
 
-    if PREFERRED_JUDGE in all_models:
+    if PREFERRED_JUDGE in available:
         chosen = PREFERRED_JUDGE
     else:
         candidates = sorted(
@@ -309,8 +350,12 @@ def get_judge_model() -> str:
             log("MODELS", f"preferred judge unavailable — using {candidates[0]}")
             chosen = candidates[0]
         else:
-            chosen = first_working_model()
-            log("MODELS", f"no Gemini judge detected — using free model {chosen}")
+            free_candidates = [
+                m for m in all_models
+                if "free" in m.lower() and not is_model_failed(m)
+            ]
+            chosen = free_candidates[0] if free_candidates else first_working_model()
+            log("MODELS", f"no Gemini judge detected — using {chosen}")
 
     _JUDGE_CACHE.update(t=now, v=chosen)
     return chosen
@@ -377,7 +422,7 @@ def _start_server_sync() -> Optional[str]:
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         try:
             proc = subprocess.Popen(
-                ["opencode", "serve", "--port", str(port),
+                [OPENCODE_BIN, "serve", "--port", str(port),
                  "--hostname", "127.0.0.1", "--pure"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -593,7 +638,7 @@ async def _run_via_subprocess(
     variant: Optional[str],
 ) -> tuple[str, str]:
     """Standalone ``opencode run`` fallback used when no server is available."""
-    cmd = ["opencode", "run", prompt, "--model", model, "--format", "json"]
+    cmd = [OPENCODE_BIN, "run", prompt, "--model", model, "--format", "json"]
     if variant:
         cmd += ["--variant", variant]
     if _PURE_CALLS:
@@ -738,6 +783,7 @@ async def call_model(
                 await asyncio.sleep(backoff)
 
     err_text = str(last_err)[:200] if last_err is not None else "unknown"
+    _SESSION_STATE["failed"] = True
     return f"[ERROR] All models failed. Last error: {err_text}"
 
 
@@ -1111,103 +1157,192 @@ async def phase_judge(
 # ---------------------------------------------------------------------------
 
 
-async def _apply_diff(diff_text: str, file_path: str) -> bool:
-    """
-    Apply a unified diff to a file using Python's built-in capabilities.
-    Falls back to ``patch`` or ``git apply`` if available.
-    Returns True on success.
-    """
-    import os
+def _diff_targets_file(diff_text: str, file_path: str) -> bool:
+    """Return True when every file header resolves to ``file_path``."""
+    targets = []
+    for line in diff_text.splitlines():
+        if line.startswith("--- "):
+            raw_target = line[4:]
+        elif line.startswith("+++ "):
+            raw_target = line[4:]
+        else:
+            continue
+        target = raw_target.split("\t", 1)[0].strip()
+        if target == "/dev/null":
+            continue
+        if target.startswith(("a/", "b/")):
+            target = target[2:]
+        if target:
+            targets.append(target)
 
+    if not targets:
+        return False
+
+    expected = os.path.normcase(os.path.abspath(file_path))
+    for target in targets:
+        if os.path.isabs(target):
+            candidate = os.path.normcase(os.path.abspath(target))
+        else:
+            candidate = os.path.normcase(os.path.abspath(os.path.join(os.getcwd(), target)))
+        if candidate != expected:
+            return False
+    return True
+
+
+async def _apply_diff(diff_text: str, file_path: str) -> bool:
+    """Apply a single-file unified diff after validating its target."""
     if not os.path.isfile(file_path):
         log("APPLY", f"File not found: {file_path}")
         return False
+    if not _diff_targets_file(diff_text, file_path):
+        log("APPLY", "Refusing diff: it does not target only the selected file")
+        return False
 
-    # Try git apply first (handles git-format diffs nicely)
-    try:
-        ret = await _shell_apply("git apply --check", diff_text)
-        if ret == 0:
-            await _shell_apply("git apply", diff_text)
+    workdir = os.getcwd()
+    check_code, check_error = await _shell_apply(
+        ["git", "apply", "--check", "--whitespace=nowarn"],
+        diff_text,
+        workdir,
+    )
+    if check_code == 0:
+        apply_code, apply_error = await _shell_apply(
+            ["git", "apply", "--whitespace=nowarn"],
+            diff_text,
+            workdir,
+        )
+        if apply_code == 0:
             log("APPLY", "Applied via git apply")
             return True
-    except Exception:
-        pass
+        log("APPLY", f"git apply failed: {apply_error.strip()[:200]}")
+    elif check_code != 127:
+        log("APPLY", f"git apply check failed: {check_error.strip()[:200]}")
 
-    # Try the `patch` command
-    try:
-        ret = await _shell_apply(
-            "patch --no-backup-if-mismatch -p1", diff_text, file_path
-        )
-        if ret == 0:
-            log("APPLY", "Applied via patch")
-            return True
-    except Exception:
-        pass
+    patch_code, patch_error = await _shell_apply(
+        ["patch", "--batch", "--forward", "--no-backup-if-mismatch", "-p1"],
+        diff_text,
+        workdir,
+    )
+    if patch_code == 0:
+        log("APPLY", "Applied via patch")
+        return True
+    if patch_code != 127:
+        log("APPLY", f"patch failed: {patch_error.strip()[:200]}")
 
-    # Last resort: Python difflib-based application
-    log("APPLY", "Falling back to Python difflib patch application")
+    log("APPLY", "Falling back to validated Python patch application")
     return _python_apply_diff(diff_text, file_path)
 
 
-async def _shell_apply(cmd: str, diff_text: str) -> int:
-    """Shell out to apply a diff via the given command (diff on stdin)."""
-    cmd_parts = cmd.split()
-    proc = await asyncio.create_subprocess_exec(
-        *cmd_parts,
-        stdin=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-    )
-    _, _ = await proc.communicate(input=diff_text.encode())
-    return proc.returncode
+async def _shell_apply(
+    cmd: list[str], diff_text: str, cwd: Optional[str] = None
+) -> tuple[int, str]:
+    """Run a patch command with the diff on stdin and return code/stderr."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=cwd,
+            stdin=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+        )
+    except (FileNotFoundError, OSError) as exc:
+        return 127, str(exc)
+
+    _, stderr = await proc.communicate(input=diff_text.encode())
+    return proc.returncode, stderr.decode(errors="replace")
 
 
 def _python_apply_diff(diff_text: str, file_path: str) -> bool:
-    """
-    Minimal pure-Python diff application for unified diffs.
-    Handles single-file diffs only.
-    """
-    import os
+    """Apply a validated single-file unified diff without external tools."""
+    if any(line.startswith("+++ /dev/null") for line in diff_text.splitlines()):
+        log("APPLY", "Refusing Python fallback for file deletion")
+        return False
 
-    with open(file_path, "r") as f:
-        lines = f.readlines()
+    hunk_re = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+    hunks: list[dict] = []
+    current: Optional[dict] = None
 
-    new_lines: list[str] = []
-    hunk_re = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
-
-    current_line = 0
-    for raw_line in diff_text.splitlines():
-        if raw_line.startswith("---") or raw_line.startswith("+++") or raw_line.startswith("@@"):
-            m = hunk_re.match(raw_line)
-            if m:
-                # Copy unchanged lines up to the hunk start
-                target_line = int(m.group(1)) - 1  # 0-indexed
-                while current_line < target_line and current_line < len(lines):
-                    new_lines.append(lines[current_line])
-                    current_line += 1
+    for raw_line in diff_text.splitlines(keepends=True):
+        header = raw_line.rstrip("\r\n")
+        match = hunk_re.match(header)
+        if match:
+            current = {
+                "start": int(match.group(1)) - 1,
+                "old_count": int(match.group(2) or 1),
+                "new_count": int(match.group(4) or 1),
+                "lines": [],
+            }
+            hunks.append(current)
             continue
+        if current is None or raw_line.startswith("\\"):
+            continue
+        if not raw_line or raw_line[0] not in " +-":
+            log("APPLY", "Refusing malformed diff hunk")
+            return False
+        current["lines"].append(raw_line)
 
-        if raw_line.startswith("-"):
-            # Deletion — skip the line from original
-            current_line += 1
-        elif raw_line.startswith("+"):
-            # Addition — insert new line
-            new_lines.append(raw_line[1:] + "\n")
-        else:
-            # Context line — copy
-            if current_line < len(lines):
-                new_lines.append(lines[current_line])
-                current_line += 1
+    if not hunks:
+        log("APPLY", "Refusing diff: no hunks found")
+        return False
 
-    # Copy any remaining lines
-    while current_line < len(lines):
-        new_lines.append(lines[current_line])
-        current_line += 1
+    with open(file_path, "r", newline="") as source:
+        original = source.readlines()
 
-    with open(file_path, "w") as f:
-        f.writelines(new_lines)
+    result: list[str] = []
+    cursor = 0
+    for hunk in hunks:
+        start = hunk["start"]
+        lines = hunk["lines"]
+        old_seen = sum(1 for line in lines if line[0] in " -")
+        new_seen = sum(1 for line in lines if line[0] in " +")
+        if old_seen != hunk["old_count"] or new_seen != hunk["new_count"]:
+            log("APPLY", "Refusing diff: hunk line counts do not match")
+            return False
+        if start < cursor or start > len(original):
+            log("APPLY", "Refusing diff: hunk is outside the target file")
+            return False
 
-    log("APPLY", "Applied via Python fallback")
+        result.extend(original[cursor:start])
+        position = start
+        for line in lines:
+            content = line[1:]
+            if line[0] in " -":
+                if position >= len(original):
+                    log("APPLY", "Refusing diff: unexpected end of file")
+                    return False
+                if original[position].rstrip("\r\n") != content.rstrip("\r\n"):
+                    log("APPLY", "Refusing diff: context does not match the file")
+                    return False
+                if line[0] == " ":
+                    result.append(original[position])
+                position += 1
+            else:
+                result.append(content if content.endswith(("\n", "\r")) else content + "\n")
+        cursor = position
+
+    result.extend(original[cursor:])
+    directory = os.path.dirname(os.path.abspath(file_path)) or "."
+    mode = os.stat(file_path).st_mode & 0o777
+    temporary_path = None
+    try:
+        descriptor, temporary_path = tempfile.mkstemp(
+            prefix=".genesis-", suffix=".tmp", dir=directory
+        )
+        with os.fdopen(descriptor, "w", newline="") as destination:
+            destination.writelines(result)
+            destination.flush()
+            os.fsync(destination.fileno())
+        os.chmod(temporary_path, mode)
+        os.replace(temporary_path, file_path)
+    except OSError as exc:
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
+        log("APPLY", f"Python patch failed: {exc}")
+        return False
+
+    log("APPLY", "Applied via validated Python fallback")
     return True
 
 
@@ -1294,6 +1429,7 @@ async def run_council(
         except Exception as e:
             log("INIT", f"Could not read {file_path}: {e}")
 
+    reset_session_state()
     reset_model_states()
 
     # --- Phase 0: Triage (skipped if the user picked models interactively) ---
@@ -3473,7 +3609,7 @@ def interactive_mode() -> None:
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser(
         prog="council",
         description="Multi-LLM orchestrator for collaborative coding assistance",
@@ -3481,7 +3617,7 @@ def main() -> None:
     parser.add_argument(
         "request",
         nargs="?",
-        help="The coding question or request to discuss (omit to launch interactive mode)",
+        help="The coding question or request to discuss (omit to launch the GUI)",
     )
     parser.add_argument(
         "--file",
@@ -3507,10 +3643,11 @@ def main() -> None:
                 "Falling back to the terminal interface.\n"
             )
             interactive_mode()
-        sys.exit(0)
+        return 0
 
     asyncio.run(run_council(args.request, args.file_path))
+    return 1 if session_failed() else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
